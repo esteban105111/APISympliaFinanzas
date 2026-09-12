@@ -38,7 +38,7 @@ app.use(cors({
     error.status = 403;
     return callback(error);
   },
-  methods: ['GET', 'POST', 'PATCH'],
+  methods: ['GET', 'POST', 'PATCH', 'DELETE'],
   allowedHeaders: ['Authorization', 'Content-Type', 'Accept'],
   maxAge: 86400,
 }));
@@ -637,4 +637,10 @@ app.use((error, _, res, next) => {
   return res.status(500).json({ error: 'Ocurrió un error interno. Intenta nuevamente.' });
 });
 
-app.listen(port, () => console.log(`API on http://localhost:${port}`));
+// En Vercel Express se ejecuta como función serverless; en local conserva el
+// servidor HTTP tradicional para `npm run start`.
+if (!process.env.VERCEL) {
+  app.listen(port, () => console.log(`API on http://localhost:${port}`));
+}
+
+export default app;
