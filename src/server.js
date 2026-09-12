@@ -7,7 +7,7 @@ import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
 import ExcelJS from 'exceljs';
 import PDFDocument from 'pdfkit';
-import { pool } from './db.js';
+import { pool, query, connect } from './db.js';
 
 dotenv.config();
 const app = express();
@@ -60,7 +60,7 @@ const authLimiter = rateLimit({
 });
 app.use(express.json({ limit: '100kb' }));
 
-const rows = async (sql, values) => (await pool.query(sql, values)).rows;
+const rows = async (sql, values) => (await query(sql, values)).rows;
 const auth = (req, res, next) => {
   try {
     const header = req.headers.authorization || '';
@@ -181,7 +181,7 @@ app.get('/health', (_, res) => res.json({ status: 'ok' }));
 app.post('/auth/register', authLimiter, async (req, res) => {
   const { name, email, password, national_id, phone, address, city, birth_date } = req.body;
   if (!name?.trim() || !validEmail(email) || !validPassword(password) || !national_id?.trim() || !phone?.trim() || !address?.trim() || !city?.trim() || !birth_date || !validDate(dateFrom(birth_date))) return res.status(400).json({ error: 'Completa tus datos. La contraseña debe tener mínimo 10 caracteres, mayúscula, minúscula y número.' });
-  const client = await pool.connect();
+  const client = await connect();
   try {
     await client.query('BEGIN');
     const { rows: [user] } = await client.query('INSERT INTO users(name,email,password_hash,national_id,phone,address,city,birth_date) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,name,email,currency,onboarding_completed', [name.trim(), email.toLowerCase(), await bcrypt.hash(password, 12), national_id.trim(), phone.trim(), address.trim(), city.trim(), birth_date]);
@@ -246,7 +246,7 @@ app.post('/scheduled_payments', auth, async (req, res) => {
   const { account_id, category_id, name, amount, payment_day, next_due_date, frequency = 'monthly', notes } = req.body;
   const value = Number(amount); const day = Number(payment_day);
   if (!name?.trim() || !Number.isFinite(value) || value <= 0 || ![15, 30].includes(day) || !validDate(dateFrom(next_due_date)) || !['monthly', 'once'].includes(frequency)) return res.status(400).json({ error: 'Datos del pago programado inválidos' });
-  const client = await pool.connect();
+  const client = await connect();
   try {
     await client.query('BEGIN');
     await ensureOwnedReference(client, 'accounts', account_id, req.user.id, 'Cuenta');
@@ -270,7 +270,7 @@ app.patch('/categories/:id', auth, async (req, res) => {
   if (!category) return res.status(404).json({ error: 'Categoría no encontrada' }); res.json(category);
 });
 app.delete('/categories/:id', auth, async (req, res) => {
-  const client = await pool.connect();
+  const client = await connect();
   try {
     await client.query('BEGIN');
     const { rows: [category] } = await client.query('SELECT id FROM categories WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
@@ -289,7 +289,7 @@ app.post('/transactions', auth, async (req, res) => {
   const { account_id, category_id, type, amount, transaction_date, note } = req.body;
   const value = Number(amount);
   if (!account_id || !['income', 'expense'].includes(type) || !Number.isFinite(value) || value <= 0) return res.status(400).json({ error: 'Movimiento inválido' });
-  const client = await pool.connect();
+  const client = await connect();
   try {
     await client.query('BEGIN');
     const [account] = (await client.query('SELECT id FROM accounts WHERE id=$1 AND user_id=$2 AND is_active', [account_id, req.user.id])).rows;
@@ -316,7 +316,7 @@ app.patch('/credit_cards/:id', auth, async (req, res) => {
   if (!card) return res.status(404).json({ error: 'Tarjeta no encontrada' }); res.json(card);
 });
 app.delete('/credit_cards/:id', auth, async (req, res) => {
-  const client = await pool.connect();
+  const client = await connect();
   try {
     await client.query('BEGIN');
     const { rows: [card] } = await client.query('SELECT id FROM credit_cards WHERE id=$1 AND user_id=$2 FOR UPDATE', [req.params.id, req.user.id]);
@@ -332,7 +332,7 @@ app.post('/card-purchases', auth, async (req, res) => {
   const { card_id, category_id, amount, installments, purchase_date, description } = req.body;
   const value = Number(amount); const count = Number(installments); const purchaseDate = purchase_date || dateText(new Date());
   if (!card_id || !description?.trim() || !Number.isFinite(value) || value <= 0 || !Number.isInteger(count) || count < 1 || !validDate(dateFrom(purchaseDate))) return res.status(400).json({ error: 'Datos de compra inválidos' });
-  const client = await pool.connect();
+  const client = await connect();
   try {
     await client.query('BEGIN');
     const [card] = (await client.query('SELECT * FROM credit_cards WHERE id=$1 AND user_id=$2 AND is_active FOR UPDATE', [card_id, req.user.id])).rows;
@@ -354,7 +354,7 @@ app.get('/debts', auth, async (req, res) => res.json(await rows(`SELECT d.*,cc.n
 app.post('/debts', auth, async (req, res) => {
   const { name, amount, total_installments, frequency, first_payment_date, interest_rate_monthly = 0 } = req.body; const value = Number(amount); const count = Number(total_installments); const rate = Number(interest_rate_monthly);
   if (!name || !Number.isFinite(value) || value <= 0 || !Number.isInteger(count) || count < 1 || !Number.isFinite(rate) || rate < 0 || !['monthly', 'biweekly'].includes(frequency) || !first_payment_date || !validDate(dateFrom(first_payment_date))) return res.status(400).json({ error: 'Datos de deuda inválidos' });
-  const client = await pool.connect();
+  const client = await connect();
   try {
     await client.query('BEGIN'); const plan = paymentPlan(value, count, rate, frequency);
     const [debt] = (await client.query(`INSERT INTO debts(user_id,name,original_amount,outstanding_amount,total_payable,interest_rate_monthly,total_installments,payment_day,start_date,frequency,first_payment_date) VALUES($1,$2,$3,$4,$4,$5,$6,$7,$8,$9,$8) RETURNING *`, [req.user.id, name.trim(), value, plan.totalPayable, rate, count, dateFrom(first_payment_date).getDate(), first_payment_date, frequency])).rows;
@@ -364,7 +364,7 @@ app.post('/debts', auth, async (req, res) => {
 });
 app.patch('/debts/:id', auth, async (req, res) => {
   const { name, amount, total_installments, frequency, first_payment_date, interest_rate_monthly } = req.body;
-  const client = await pool.connect();
+  const client = await connect();
   try {
     await client.query('BEGIN');
     const { rows: [debt] } = await client.query('SELECT d.*,COUNT(i.id) FILTER (WHERE i.status=\'paid\')::int paid_count FROM debts d LEFT JOIN debt_installments i ON i.debt_id=d.id WHERE d.id=$1 AND d.user_id=$2 GROUP BY d.id FOR UPDATE', [req.params.id, req.user.id]);
@@ -387,7 +387,7 @@ app.patch('/debts/:id', auth, async (req, res) => {
   } catch (error) { await client.query('ROLLBACK'); res.status(400).json({ error: safeError(error, 'No se pudo actualizar la deuda.') }); } finally { client.release(); }
 });
 app.delete('/debts/:id', auth, async (req, res) => {
-  const client = await pool.connect();
+  const client = await connect();
   try {
     await client.query('BEGIN');
     const { rows: [debt] } = await client.query('SELECT * FROM debts WHERE id=$1 AND user_id=$2 FOR UPDATE', [req.params.id, req.user.id]);
@@ -400,7 +400,7 @@ app.delete('/debts/:id', auth, async (req, res) => {
 });
 app.get('/debts/:id/installments', auth, async (req, res) => res.json(await rows('SELECT i.* FROM debt_installments i JOIN debts d ON d.id=i.debt_id WHERE i.debt_id=$1 AND d.user_id=$2 ORDER BY i.installment_number', [req.params.id, req.user.id])));
 app.patch('/debt-installments/:id/pay', auth, async (req, res) => {
-  const client = await pool.connect();
+  const client = await connect();
   try {
     await client.query('BEGIN');
     const [installment] = (await client.query(`SELECT i.*,d.user_id,d.id debt_uuid,d.name debt_name,d.credit_card_id FROM debt_installments i JOIN debts d ON d.id=i.debt_id WHERE i.id=$1 FOR UPDATE`, [req.params.id])).rows;
@@ -488,7 +488,7 @@ app.patch('/accounts/:id', auth, async (req, res) => {
   if (!account) return res.status(404).json({ error: 'Cuenta no encontrada' }); res.json(account);
 });
 app.delete('/accounts/:id', auth, async (req, res) => {
-  const client = await pool.connect();
+  const client = await connect();
   try {
     await client.query('BEGIN');
     const { rows: [account] } = await client.query('SELECT id FROM accounts WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
@@ -552,7 +552,7 @@ app.post('/investments', auth, async (req, res) => {
   const { name, type = 'other', target_amount, target_date, start_date, notes, color = '#7C3AED', initial_amount = 0, account_id } = req.body;
   const target = target_amount == null ? null : Number(target_amount); const initial = Number(initial_amount);
   if (!name?.trim() || !['real_estate', 'stock', 'fund', 'business', 'other'].includes(type) || !Number.isFinite(initial) || initial < 0 || (target != null && (!Number.isFinite(target) || target < 0))) return res.status(400).json({ error: 'Datos de ahorro o inversión inválidos' });
-  const client = await pool.connect();
+  const client = await connect();
   try {
     await client.query('BEGIN');
     let transactionId = null;
@@ -577,7 +577,7 @@ app.patch('/investments/:id', auth, async (req, res) => {
   if (!investment) return res.status(404).json({ error: 'Ahorro o inversión no encontrado' }); res.json(investment);
 });
 app.delete('/investments/:id', auth, async (req, res) => {
-  const { rowCount } = await pool.query('DELETE FROM investments WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+  const { rowCount } = await query('DELETE FROM investments WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
   if (!rowCount) return res.status(404).json({ error: 'Ahorro o inversión no encontrado' });
   res.json({ ok: true, preserved_history: true });
 });
@@ -585,7 +585,7 @@ app.get('/investments/:id/contributions', auth, async (req, res) => res.json(awa
 app.post('/investments/:id/contributions', auth, async (req, res) => {
   const { amount, contribution_date, note, account_id } = req.body; const value = Number(amount); const date = contribution_date || dateText(new Date());
   if (!Number.isFinite(value) || value <= 0 || !validDate(dateFrom(date))) return res.status(400).json({ error: 'Aporte inválido' });
-  const client = await pool.connect();
+  const client = await connect();
   try {
     await client.query('BEGIN');
     const [investment] = (await client.query('SELECT * FROM investments WHERE id=$1 AND user_id=$2 AND status=\'active\' FOR UPDATE', [req.params.id, req.user.id])).rows;
@@ -604,14 +604,14 @@ app.post('/investments/:id/contributions', auth, async (req, res) => {
   } catch (error) { await client.query('ROLLBACK'); res.status(400).json({ error: safeError(error, 'No se pudo registrar el aporte.') }); } finally { client.release(); }
 });
 app.patch('/scheduled_payments/:id/pay', auth, async (req, res) => {
-  const client = await pool.connect();
+  const client = await connect();
   try { await client.query('BEGIN'); const [p] = (await client.query('SELECT * FROM scheduled_payments WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id])).rows; if (!p) throw clientError('Pago no encontrado'); const accountId = req.body?.account_id || p.account_id; if (!accountId) throw clientError('Selecciona una cuenta para pagar'); const [account] = (await client.query('SELECT id FROM accounts WHERE id=$1 AND user_id=$2 AND is_active', [accountId, req.user.id])).rows; if (!account) throw clientError('Cuenta de pago inválida'); await client.query('INSERT INTO scheduled_payment_history(scheduled_payment_id,amount) VALUES($1,$2)', [p.id, p.amount]); await client.query("INSERT INTO transactions(user_id,account_id,category_id,type,amount,transaction_date,note) VALUES($1,$2,$3,'expense',$4,current_date,$5)", [req.user.id, accountId, p.category_id, p.amount, `Pago programado: ${p.name}`]); await client.query('UPDATE accounts SET current_balance=current_balance-$1 WHERE id=$2 AND user_id=$3', [p.amount, accountId, req.user.id]); await client.query("UPDATE scheduled_payments SET next_due_date=(next_due_date + interval '1 month')::date WHERE id=$1", [p.id]); await client.query('COMMIT'); res.json({ ok: true }); } catch (error) { await client.query('ROLLBACK'); res.status(400).json({ error: safeError(error, 'No se pudo registrar el pago.') }); } finally { client.release(); }
 });
 app.patch('/scheduled_payments/:id', auth, async (req, res) => {
   const { account_id, category_id, name, amount, payment_day, next_due_date, frequency, notes, is_active } = req.body;
   const value = Number(amount); const day = Number(payment_day);
   if (!name?.trim() || !Number.isFinite(value) || value <= 0 || ![15, 30].includes(day) || !validDate(dateFrom(next_due_date)) || !['monthly', 'once'].includes(frequency)) return res.status(400).json({ error: 'Datos del pago fijo inválidos' });
-  const client = await pool.connect();
+  const client = await connect();
   try {
     await client.query('BEGIN');
     const { rows: [exists] } = await client.query('SELECT id FROM scheduled_payments WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
@@ -624,7 +624,7 @@ app.patch('/scheduled_payments/:id', auth, async (req, res) => {
   } catch (error) { await client.query('ROLLBACK'); res.status(400).json({ error: safeError(error, 'No se pudo actualizar el pago fijo.') }); } finally { client.release(); }
 });
 app.delete('/scheduled_payments/:id', auth, async (req, res) => {
-  const { rowCount } = await pool.query('DELETE FROM scheduled_payments WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+  const { rowCount } = await query('DELETE FROM scheduled_payments WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
   if (!rowCount) return res.status(404).json({ error: 'Pago fijo no encontrado' });
   res.json({ ok: true, preserved_history: true });
 });
