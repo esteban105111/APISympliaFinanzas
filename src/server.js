@@ -120,6 +120,32 @@ const insertSchedule = async (client, debtId, installments, firstPaymentDate, fr
     [debtId, index + 1, dueFor(firstPaymentDate, frequency, index), amount],
   );
 };
+// Al borrar una obligación también eliminamos sus movimientos automáticos y
+// devolvemos a la cuenta el dinero que esos movimientos habían descontado.
+const removeLinkedTransactions = async (client, userId, condition, values = []) => {
+  const { rows: transactions } = await client.query(
+    `SELECT id,account_id,type,amount FROM transactions
+     WHERE user_id=$1 AND (${condition}) FOR UPDATE`,
+    [userId, ...values],
+  );
+  const balances = new Map();
+  for (const transaction of transactions) {
+    if (!transaction.account_id) continue;
+    const amount = Number(transaction.amount);
+    const rollback = transaction.type === 'income' ? -amount : amount;
+    balances.set(transaction.account_id, (balances.get(transaction.account_id) || 0) + rollback);
+  }
+  for (const [accountId, amount] of balances) {
+    await client.query(
+      'UPDATE accounts SET current_balance=current_balance+$1 WHERE id=$2 AND user_id=$3',
+      [amount, accountId, userId],
+    );
+  }
+  if (transactions.length) {
+    await client.query('DELETE FROM transactions WHERE id = ANY($1::uuid[])', [transactions.map((transaction) => transaction.id)]);
+  }
+  return transactions.length;
+};
 const defaultCategories = [
   ['Salario', 'income', 'salary', '#1E3A5F'],
   ['Ingresos extra', 'income', 'salary', '#4F7CAC'],
@@ -321,10 +347,16 @@ app.delete('/credit_cards/:id', auth, async (req, res) => {
     await client.query('BEGIN');
     const { rows: [card] } = await client.query('SELECT id FROM credit_cards WHERE id=$1 AND user_id=$2 FOR UPDATE', [req.params.id, req.user.id]);
     if (!card) throw clientError('Tarjeta no encontrada');
-    await client.query('UPDATE debts SET credit_card_id=NULL WHERE user_id=$1 AND credit_card_id=$2', [req.user.id, card.id]);
+    const deletedTransactions = await removeLinkedTransactions(
+      client,
+      req.user.id,
+      'card_id=$2 OR debt_id IN (SELECT id FROM debts WHERE user_id=$1 AND credit_card_id=$2)',
+      [card.id],
+    );
+    await client.query('DELETE FROM debts WHERE user_id=$1 AND credit_card_id=$2', [req.user.id, card.id]);
     await client.query('DELETE FROM credit_cards WHERE id=$1 AND user_id=$2', [card.id, req.user.id]);
     await client.query('COMMIT');
-    res.json({ ok: true, preserved_history: true });
+    res.json({ ok: true, deleted_transactions: deletedTransactions });
   } catch (error) { await client.query('ROLLBACK'); res.status(400).json({ error: safeError(error, 'No se pudo eliminar la tarjeta.') }); } finally { client.release(); }
 });
 app.get('/card-purchases', auth, async (req, res) => res.json(await rows(`SELECT cp.*,cc.name card_name,d.outstanding_amount,d.status debt_status,d.total_payable FROM card_purchases cp JOIN credit_cards cc ON cc.id=cp.card_id JOIN debts d ON d.id=cp.debt_id WHERE cp.user_id=$1 ORDER BY cp.purchase_date DESC,cp.created_at DESC`, [req.user.id])));
@@ -344,7 +376,7 @@ app.post('/card-purchases', auth, async (req, res) => {
     const [debt] = (await client.query(`INSERT INTO debts(user_id,name,original_amount,outstanding_amount,total_payable,interest_rate_monthly,total_installments,payment_day,start_date,frequency,first_payment_date,credit_card_id) VALUES($1,$2,$3,$4,$4,$5,$6,$7,$8,'monthly',$9,$10) RETURNING *`, [req.user.id, `Compra ${card.name}: ${description.trim()}`, value, plan.totalPayable, Number(card.interest_rate_monthly), count, dateFrom(firstPaymentDate).getDate(), purchaseDate, firstPaymentDate, card.id])).rows;
     await insertSchedule(client, debt.id, count, firstPaymentDate, 'monthly', plan.installmentAmount);
     const [purchase] = (await client.query('INSERT INTO card_purchases(user_id,card_id,debt_id,category_id,amount,installments,purchase_date,first_payment_date,description) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *', [req.user.id, card.id, debt.id, category_id || null, value, count, purchaseDate, firstPaymentDate, description.trim()])).rows;
-    await client.query("INSERT INTO transactions(user_id,card_id,category_id,type,amount,transaction_date,note) VALUES($1,$2,$3,'expense',$4,$5,$6)", [req.user.id, card.id, category_id || null, value, purchaseDate, `Compra con ${card.name}: ${description.trim()}`]);
+    await client.query("INSERT INTO transactions(user_id,card_id,category_id,debt_id,type,amount,transaction_date,note) VALUES($1,$2,$3,$4,'expense',$5,$6,$7)", [req.user.id, card.id, category_id || null, debt.id, value, purchaseDate, `Compra con ${card.name}: ${description.trim()}`]);
     await client.query('UPDATE credit_cards SET current_debt=current_debt+$1 WHERE id=$2', [plan.totalPayable, card.id]);
     await client.query('COMMIT'); res.status(201).json({ purchase, debt, installment_amount: plan.installmentAmount, first_payment_date: firstPaymentDate });
   } catch (error) { await client.query('ROLLBACK'); res.status(400).json({ error: safeError(error, 'No se pudo registrar la compra con tarjeta.') }); } finally { client.release(); }
@@ -392,10 +424,11 @@ app.delete('/debts/:id', auth, async (req, res) => {
     await client.query('BEGIN');
     const { rows: [debt] } = await client.query('SELECT * FROM debts WHERE id=$1 AND user_id=$2 FOR UPDATE', [req.params.id, req.user.id]);
     if (!debt) throw clientError('Deuda no encontrada');
+    const deletedTransactions = await removeLinkedTransactions(client, req.user.id, 'debt_id=$2', [debt.id]);
     if (debt.credit_card_id) await client.query('UPDATE credit_cards SET current_debt=GREATEST(0,current_debt-$1) WHERE id=$2 AND user_id=$3', [debt.outstanding_amount, debt.credit_card_id, req.user.id]);
     await client.query('DELETE FROM debts WHERE id=$1 AND user_id=$2', [debt.id, req.user.id]);
     await client.query('COMMIT');
-    res.json({ ok: true, preserved_history: true });
+    res.json({ ok: true, deleted_transactions: deletedTransactions });
   } catch (error) { await client.query('ROLLBACK'); res.status(400).json({ error: safeError(error, 'No se pudo eliminar la deuda.') }); } finally { client.release(); }
 });
 app.get('/debts/:id/installments', auth, async (req, res) => res.json(await rows('SELECT i.* FROM debt_installments i JOIN debts d ON d.id=i.debt_id WHERE i.debt_id=$1 AND d.user_id=$2 ORDER BY i.installment_number', [req.params.id, req.user.id])));
@@ -407,7 +440,7 @@ app.patch('/debt-installments/:id/pay', auth, async (req, res) => {
     if (!installment || installment.user_id !== req.user.id) throw clientError('Cuota no encontrada'); if (installment.status === 'paid') throw clientError('Esta cuota ya fue pagada');
     const accountId = req.body?.account_id; if (!accountId) throw clientError('Selecciona la cuenta desde la que realizaste el pago');
     const [account] = (await client.query('SELECT id FROM accounts WHERE id=$1 AND user_id=$2 AND is_active=true', [accountId, req.user.id])).rows; if (!account) throw clientError('Cuenta de pago inválida');
-    await client.query('INSERT INTO transactions(user_id,account_id,card_id,type,amount,transaction_date,note) VALUES($1,$2,$3,$4,$5,current_date,$6)', [req.user.id, accountId, installment.credit_card_id || null, installment.credit_card_id ? 'transfer' : 'expense', installment.amount, installment.credit_card_id ? `Pago de tarjeta: ${installment.debt_name}` : `Cuota de deuda: ${installment.debt_name}`]);
+    await client.query('INSERT INTO transactions(user_id,account_id,card_id,debt_id,type,amount,transaction_date,note) VALUES($1,$2,$3,$4,$5,$6,current_date,$7)', [req.user.id, accountId, installment.credit_card_id || null, installment.debt_uuid, installment.credit_card_id ? 'transfer' : 'expense', installment.amount, installment.credit_card_id ? `Pago de tarjeta: ${installment.debt_name}` : `Cuota de deuda: ${installment.debt_name}`]);
     await client.query('UPDATE accounts SET current_balance=current_balance-$1 WHERE id=$2', [installment.amount, accountId]);
     await client.query("UPDATE debt_installments SET status='paid',paid_at=current_date WHERE id=$1", [installment.id]);
     const [debt] = (await client.query('UPDATE debts SET outstanding_amount=GREATEST(0,outstanding_amount-$1) WHERE id=$2 RETURNING *', [installment.amount, installment.debt_uuid])).rows;
@@ -555,15 +588,15 @@ app.post('/investments', auth, async (req, res) => {
   const client = await connect();
   try {
     await client.query('BEGIN');
+    const [investment] = (await client.query('INSERT INTO investments(user_id,name,type,target_amount,current_amount,start_date,target_date,notes,color) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *', [req.user.id, name.trim(), type, target, initial, start_date || dateText(new Date()), target_date || null, notes?.trim() || null, color])).rows;
     let transactionId = null;
     if (account_id && initial > 0) {
       const [account] = (await client.query('SELECT id FROM accounts WHERE id=$1 AND user_id=$2 AND is_active', [account_id, req.user.id])).rows;
       if (!account) throw clientError('Cuenta de origen inválida');
-      const [transaction] = (await client.query("INSERT INTO transactions(user_id,account_id,type,amount,transaction_date,note) VALUES($1,$2,'transfer',$3,$4,$5) RETURNING id", [req.user.id, account_id, initial, start_date || dateText(new Date()), `Aporte inicial: ${name.trim()}`])).rows;
+      const [transaction] = (await client.query("INSERT INTO transactions(user_id,account_id,investment_id,type,amount,transaction_date,note) VALUES($1,$2,$3,'transfer',$4,$5,$6) RETURNING id", [req.user.id, account_id, investment.id, initial, start_date || dateText(new Date()), `Aporte inicial: ${name.trim()}`])).rows;
       transactionId = transaction.id;
       await client.query('UPDATE accounts SET current_balance=current_balance-$1 WHERE id=$2', [initial, account_id]);
     }
-    const [investment] = (await client.query('INSERT INTO investments(user_id,name,type,target_amount,current_amount,start_date,target_date,notes,color) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *', [req.user.id, name.trim(), type, target, initial, start_date || dateText(new Date()), target_date || null, notes?.trim() || null, color])).rows;
     if (initial > 0) await client.query('INSERT INTO investment_contributions(investment_id,account_id,transaction_id,amount,contribution_date,note) VALUES($1,$2,$3,$4,$5,$6)', [investment.id, account_id || null, transactionId, initial, start_date || dateText(new Date()), 'Aporte inicial']);
     await client.query('COMMIT'); res.status(201).json(investment);
   } catch (error) { await client.query('ROLLBACK'); res.status(400).json({ error: safeError(error, 'No se pudo crear el ahorro o inversión.') }); } finally { client.release(); }
@@ -577,9 +610,16 @@ app.patch('/investments/:id', auth, async (req, res) => {
   if (!investment) return res.status(404).json({ error: 'Ahorro o inversión no encontrado' }); res.json(investment);
 });
 app.delete('/investments/:id', auth, async (req, res) => {
-  const { rowCount } = await query('DELETE FROM investments WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
-  if (!rowCount) return res.status(404).json({ error: 'Ahorro o inversión no encontrado' });
-  res.json({ ok: true, preserved_history: true });
+  const client = await connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: [investment] } = await client.query('SELECT id FROM investments WHERE id=$1 AND user_id=$2 FOR UPDATE', [req.params.id, req.user.id]);
+    if (!investment) throw clientError('Ahorro o inversión no encontrado');
+    const deletedTransactions = await removeLinkedTransactions(client, req.user.id, 'investment_id=$2', [investment.id]);
+    await client.query('DELETE FROM investments WHERE id=$1 AND user_id=$2', [investment.id, req.user.id]);
+    await client.query('COMMIT');
+    res.json({ ok: true, deleted_transactions: deletedTransactions });
+  } catch (error) { await client.query('ROLLBACK'); res.status(400).json({ error: safeError(error, 'No se pudo eliminar el ahorro o inversión.') }); } finally { client.release(); }
 });
 app.get('/investments/:id/contributions', auth, async (req, res) => res.json(await rows(`SELECT ic.*,a.name account_name FROM investment_contributions ic JOIN investments i ON i.id=ic.investment_id LEFT JOIN accounts a ON a.id=ic.account_id WHERE ic.investment_id=$1 AND i.user_id=$2 ORDER BY ic.contribution_date DESC,ic.created_at DESC`, [req.params.id, req.user.id])));
 app.post('/investments/:id/contributions', auth, async (req, res) => {
@@ -594,7 +634,7 @@ app.post('/investments/:id/contributions', auth, async (req, res) => {
     if (account_id) {
       const [account] = (await client.query('SELECT id FROM accounts WHERE id=$1 AND user_id=$2 AND is_active', [account_id, req.user.id])).rows;
       if (!account) throw clientError('Cuenta de origen inválida');
-      const [transaction] = (await client.query("INSERT INTO transactions(user_id,account_id,type,amount,transaction_date,note) VALUES($1,$2,'transfer',$3,$4,$5) RETURNING id", [req.user.id, account_id, value, date, `Aporte a ${investment.name}${note ? `: ${note}` : ''}`])).rows;
+      const [transaction] = (await client.query("INSERT INTO transactions(user_id,account_id,investment_id,type,amount,transaction_date,note) VALUES($1,$2,$3,'transfer',$4,$5,$6) RETURNING id", [req.user.id, account_id, investment.id, value, date, `Aporte a ${investment.name}${note ? `: ${note}` : ''}`])).rows;
       transactionId = transaction.id;
       await client.query('UPDATE accounts SET current_balance=current_balance-$1 WHERE id=$2', [value, account_id]);
     }
@@ -605,7 +645,7 @@ app.post('/investments/:id/contributions', auth, async (req, res) => {
 });
 app.patch('/scheduled_payments/:id/pay', auth, async (req, res) => {
   const client = await connect();
-  try { await client.query('BEGIN'); const [p] = (await client.query('SELECT * FROM scheduled_payments WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id])).rows; if (!p) throw clientError('Pago no encontrado'); const accountId = req.body?.account_id || p.account_id; if (!accountId) throw clientError('Selecciona una cuenta para pagar'); const [account] = (await client.query('SELECT id FROM accounts WHERE id=$1 AND user_id=$2 AND is_active', [accountId, req.user.id])).rows; if (!account) throw clientError('Cuenta de pago inválida'); await client.query('INSERT INTO scheduled_payment_history(scheduled_payment_id,amount) VALUES($1,$2)', [p.id, p.amount]); await client.query("INSERT INTO transactions(user_id,account_id,category_id,type,amount,transaction_date,note) VALUES($1,$2,$3,'expense',$4,current_date,$5)", [req.user.id, accountId, p.category_id, p.amount, `Pago programado: ${p.name}`]); await client.query('UPDATE accounts SET current_balance=current_balance-$1 WHERE id=$2 AND user_id=$3', [p.amount, accountId, req.user.id]); await client.query("UPDATE scheduled_payments SET next_due_date=(next_due_date + interval '1 month')::date WHERE id=$1", [p.id]); await client.query('COMMIT'); res.json({ ok: true }); } catch (error) { await client.query('ROLLBACK'); res.status(400).json({ error: safeError(error, 'No se pudo registrar el pago.') }); } finally { client.release(); }
+  try { await client.query('BEGIN'); const [p] = (await client.query('SELECT * FROM scheduled_payments WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id])).rows; if (!p) throw clientError('Pago no encontrado'); const accountId = req.body?.account_id || p.account_id; if (!accountId) throw clientError('Selecciona una cuenta para pagar'); const [account] = (await client.query('SELECT id FROM accounts WHERE id=$1 AND user_id=$2 AND is_active', [accountId, req.user.id])).rows; if (!account) throw clientError('Cuenta de pago inválida'); await client.query('INSERT INTO scheduled_payment_history(scheduled_payment_id,amount) VALUES($1,$2)', [p.id, p.amount]); await client.query("INSERT INTO transactions(user_id,account_id,category_id,scheduled_payment_id,type,amount,transaction_date,note) VALUES($1,$2,$3,$4,'expense',$5,current_date,$6)", [req.user.id, accountId, p.category_id, p.id, p.amount, `Pago programado: ${p.name}`]); await client.query('UPDATE accounts SET current_balance=current_balance-$1 WHERE id=$2 AND user_id=$3', [p.amount, accountId, req.user.id]); await client.query("UPDATE scheduled_payments SET next_due_date=(next_due_date + interval '1 month')::date WHERE id=$1", [p.id]); await client.query('COMMIT'); res.json({ ok: true }); } catch (error) { await client.query('ROLLBACK'); res.status(400).json({ error: safeError(error, 'No se pudo registrar el pago.') }); } finally { client.release(); }
 });
 app.patch('/scheduled_payments/:id', auth, async (req, res) => {
   const { account_id, category_id, name, amount, payment_day, next_due_date, frequency, notes, is_active } = req.body;
@@ -624,9 +664,16 @@ app.patch('/scheduled_payments/:id', auth, async (req, res) => {
   } catch (error) { await client.query('ROLLBACK'); res.status(400).json({ error: safeError(error, 'No se pudo actualizar el pago fijo.') }); } finally { client.release(); }
 });
 app.delete('/scheduled_payments/:id', auth, async (req, res) => {
-  const { rowCount } = await query('DELETE FROM scheduled_payments WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
-  if (!rowCount) return res.status(404).json({ error: 'Pago fijo no encontrado' });
-  res.json({ ok: true, preserved_history: true });
+  const client = await connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: [payment] } = await client.query('SELECT id FROM scheduled_payments WHERE id=$1 AND user_id=$2 FOR UPDATE', [req.params.id, req.user.id]);
+    if (!payment) throw clientError('Pago fijo no encontrado');
+    const deletedTransactions = await removeLinkedTransactions(client, req.user.id, 'scheduled_payment_id=$2', [payment.id]);
+    await client.query('DELETE FROM scheduled_payments WHERE id=$1 AND user_id=$2', [payment.id, req.user.id]);
+    await client.query('COMMIT');
+    res.json({ ok: true, deleted_transactions: deletedTransactions });
+  } catch (error) { await client.query('ROLLBACK'); res.status(400).json({ error: safeError(error, 'No se pudo eliminar el pago fijo.') }); } finally { client.release(); }
 });
 
 app.use((error, _, res, next) => {
