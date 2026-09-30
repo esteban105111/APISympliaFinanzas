@@ -321,21 +321,38 @@ app.post('/auth/google', authLimiter, async (req, res) => {
     );
     if (!user) {
       const { rows: [existing] } = await client.query(
-        'SELECT id FROM users WHERE email=$1 FOR UPDATE',
+        'SELECT id,name,email,currency,onboarding_completed,google_sub FROM users WHERE email=$1 FOR UPDATE',
         [googleUser.email],
       );
       if (existing) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({ error: 'Ya existe una cuenta con ese correo. Inicia sesión con tu correo y contraseña.' });
+        // El token de Google ya fue validado y el correo viene marcado como
+        // verificado. Enlaza el sub estable a la cuenta existente, sin tocar
+        // contraseña ni datos del perfil. Nunca reemplazar otro vínculo.
+        if (existing.google_sub && existing.google_sub !== googleUser.sub) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({ error: 'Este correo ya está vinculado a otra cuenta de Google.' });
+        }
+        const { rows: [linked] } = await client.query(
+          `UPDATE users SET google_sub=$1,updated_at=now()
+           WHERE id=$2 AND (google_sub IS NULL OR google_sub=$1)
+           RETURNING id,name,email,currency,onboarding_completed`,
+          [googleUser.sub, existing.id],
+        );
+        if (!linked) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({ error: 'No se pudo vincular esta cuenta de Google.' });
+        }
+        user = linked;
+      } else {
+        const { rows: [created] } = await client.query(
+          `INSERT INTO users(name,email,password_hash,google_sub)
+           VALUES($1,$2,NULL,$3)
+           RETURNING id,name,email,currency,onboarding_completed`,
+          [googleUser.name, googleUser.email, googleUser.sub],
+        );
+        user = created;
+        await seedDefaultCategories(client, user.id);
       }
-      const { rows: [created] } = await client.query(
-        `INSERT INTO users(name,email,password_hash,google_sub)
-         VALUES($1,$2,NULL,$3)
-         RETURNING id,name,email,currency,onboarding_completed`,
-        [googleUser.name, googleUser.email, googleUser.sub],
-      );
-      user = created;
-      await seedDefaultCategories(client, user.id);
     }
     const token = createToken(user);
     await client.query('COMMIT');
