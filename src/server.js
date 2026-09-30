@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { OAuth2Client } from 'google-auth-library';
 import dotenv from 'dotenv';
 import { createHmac, randomInt, timingSafeEqual } from 'node:crypto';
 import ExcelJS from 'exceljs';
@@ -24,6 +25,7 @@ const jwtIssuer = 'symplia-finanzas';
 const jwtAudience = 'symplia-client';
 const jwtVerificationOptions = { algorithms: ['HS256'], issuer: jwtIssuer, audience: jwtAudience };
 const jwtExpiresIn = process.env.JWT_EXPIRES_IN || '24h';
+const googleTokenVerifier = new OAuth2Client();
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL es obligatoria.');
 if (!secret || (production && secret.length < 32)) throw new Error('JWT_SECRET debe tener al menos 32 caracteres en producción.');
@@ -288,6 +290,64 @@ app.post('/auth/login', authLimiter, async (req, res) => {
   if (!user || !await bcrypt.compare(req.body.password || '', user.password_hash)) return res.status(401).json({ error: 'Credenciales inválidas' });
   if (bcrypt.getRounds(user.password_hash) < 12) await rows('UPDATE users SET password_hash=$1,updated_at=now() WHERE id=$2', [await bcrypt.hash(req.body.password, 12), user.id]);
   res.json({ user: { id: user.id, name: user.name, email: user.email, currency: user.currency, onboarding_completed: user.onboarding_completed }, token: createToken(user) });
+});
+app.post('/auth/google', authLimiter, async (req, res) => {
+  const idToken = req.body?.id_token;
+  if (typeof idToken !== 'string' || idToken.length > 10_000) {
+    return res.status(400).json({ error: 'No se recibió un token válido de Google.' });
+  }
+  const audiences = [process.env.GOOGLE_WEB_CLIENT_ID, process.env.GOOGLE_ANDROID_CLIENT_ID].filter(Boolean);
+  if (!audiences.length) return res.status(503).json({ error: 'El inicio con Google aún no está configurado en el servidor.' });
+
+  let googleUser;
+  try {
+    const ticket = await googleTokenVerifier.verifyIdToken({ idToken, audience: audiences });
+    const payload = ticket.getPayload();
+    if (
+      !payload?.sub || !validEmail(payload.email) || payload.email_verified !== true ||
+      !['accounts.google.com', 'https://accounts.google.com'].includes(payload.iss || '')
+    ) throw new Error('Claims de identidad no válidos');
+    googleUser = { sub: payload.sub, email: payload.email.toLowerCase(), name: payload.name?.trim() || payload.email.split('@')[0] };
+  } catch (_) {
+    return res.status(401).json({ error: 'No se pudo verificar tu cuenta de Google. Intenta nuevamente.' });
+  }
+
+  const client = await connect();
+  try {
+    await client.query('BEGIN');
+    let { rows: [user] } = await client.query(
+      'SELECT id,name,email,currency,onboarding_completed FROM users WHERE google_sub=$1 FOR UPDATE',
+      [googleUser.sub],
+    );
+    if (!user) {
+      const { rows: [existing] } = await client.query(
+        'SELECT id FROM users WHERE email=$1 FOR UPDATE',
+        [googleUser.email],
+      );
+      if (existing) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Ya existe una cuenta con ese correo. Inicia sesión con tu correo y contraseña.' });
+      }
+      const { rows: [created] } = await client.query(
+        `INSERT INTO users(name,email,password_hash,google_sub)
+         VALUES($1,$2,NULL,$3)
+         RETURNING id,name,email,currency,onboarding_completed`,
+        [googleUser.name, googleUser.email, googleUser.sub],
+      );
+      user = created;
+      await seedDefaultCategories(client, user.id);
+    }
+    const token = createToken(user);
+    await client.query('COMMIT');
+    return res.json({ user, token });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    if (error.code === '23505') return res.status(409).json({ error: 'Esta cuenta de Google ya está vinculada a otro perfil.' });
+    console.error('No se pudo iniciar sesión con Google:', error?.message || error);
+    return res.status(500).json({ error: 'No se pudo iniciar sesión con Google.' });
+  } finally {
+    client.release();
+  }
 });
 const passwordResetMessage = 'Si el correo corresponde a una cuenta, enviaremos un código de recuperación.';
 app.post('/auth/forgot-password', passwordResetLimiter, async (req, res) => {
