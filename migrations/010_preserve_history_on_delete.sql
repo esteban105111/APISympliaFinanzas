@@ -7,4 +7,5 @@ ALTER TABLE transactions
       (account_id IS NOT NULL AND card_id IS NULL)
       OR (account_id IS NULL AND card_id IS NOT NULL)
       OR (account_id IS NULL AND card_id IS NULL)
+      OR (account_id IS NOT NULL AND card_id IS NOT NULL AND type = 'transfer')
     );

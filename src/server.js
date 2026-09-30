@@ -5,6 +5,7 @@ import { rateLimit } from 'express-rate-limit';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
+import { createHmac, randomInt, timingSafeEqual } from 'node:crypto';
 import ExcelJS from 'exceljs';
 import PDFDocument from 'pdfkit';
 import { pool, query, connect } from './db.js';
@@ -58,6 +59,13 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: 'Demasiados intentos. Espera unos minutos antes de volver a intentarlo.' },
 });
+const passwordResetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Demasiadas solicitudes. Espera unos minutos antes de volver a intentarlo.' },
+});
 app.use(express.json({ limit: '100kb' }));
 
 const rows = async (sql, values) => (await query(sql, values)).rows;
@@ -81,6 +89,28 @@ const validPassword = (password) => typeof password === 'string'
   && /[a-z]/.test(password) && /[A-Z]/.test(password) && /\d/.test(password);
 const clientError = (message) => Object.assign(new Error(message), { expose: true });
 const safeError = (error, fallback) => error?.expose ? error.message : fallback;
+const resetCodeHash = (code) => createHmac('sha256', secret).update(code).digest('hex');
+const sendPasswordResetEmail = async (email, code) => {
+  const apiKey = process.env.RESEND_API_KEY;
+  const sender = process.env.EMAIL_FROM;
+  if (!apiKey || !sender) {
+    if (!production) console.info(`Código de recuperación para ${email}: ${code}`);
+    else console.warn('No se envió el código de recuperación: configura RESEND_API_KEY y EMAIL_FROM.');
+    return;
+  }
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: sender,
+      to: [email],
+      subject: 'Recupera el acceso a Symplia Finanzas',
+      text: `Tu código de recuperación es ${code}. Vence en 15 minutos. Si no solicitaste este cambio, ignora este correo.`,
+      html: `<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;color:#1e3a5f"><h1>Recupera tu acceso</h1><p>Usa este código en Symplia Finanzas:</p><p style="font-size:32px;font-weight:bold;letter-spacing:8px">${code}</p><p>El código vence en 15 minutos y solo puede usarse una vez.</p><p>Si no solicitaste este cambio, ignora este correo.</p></div>`,
+    }),
+  });
+  if (!response.ok) throw new Error(`Resend rechazó el correo (${response.status})`);
+};
 const dateText = (date) => date.toISOString().slice(0, 10);
 const dateFrom = (text) => {
   // PostgreSQL puede entregar los campos DATE como Date; no les agregamos una
@@ -119,6 +149,37 @@ const insertSchedule = async (client, debtId, installments, firstPaymentDate, fr
     'INSERT INTO debt_installments(debt_id,installment_number,due_date,amount) VALUES($1,$2,$3,$4)',
     [debtId, index + 1, dueFor(firstPaymentDate, frequency, index), amount],
   );
+};
+const insertUpdatedSchedule = async (client, debtId, installments, firstPaymentDate, frequency, totalPayable, paidInstallments) => {
+  const paidCount = paidInstallments.length;
+  const paidTotal = paidInstallments.reduce((sum, installment) => sum + Number(installment.amount), 0);
+  const paidByNumber = new Map(paidInstallments.map((installment) => [Number(installment.installment_number), installment]));
+  const pendingCount = installments - paidCount;
+  const pendingTotal = Math.round((totalPayable - paidTotal) * 100) / 100;
+  const pendingAmount = pendingCount > 0
+    ? Math.floor((pendingTotal * 100) / pendingCount) / 100
+    : 0;
+  for (let index = 0; index < installments; index += 1) {
+    const number = index + 1;
+    const previous = paidByNumber.get(number);
+    const pendingIndex = number - 1 - [...paidByNumber.keys()].filter((paidNumber) => paidNumber < number).length;
+    await client.query(
+      `INSERT INTO debt_installments(debt_id,installment_number,due_date,amount,status,paid_at)
+       VALUES($1,$2,$3,$4,$5,$6)`,
+      [
+        debtId,
+        number,
+        dueFor(firstPaymentDate, frequency, index),
+        previous
+          ? previous.amount
+          : pendingIndex === pendingCount - 1
+          ? Math.round((pendingTotal - pendingAmount * (pendingCount - 1)) * 100) / 100
+          : pendingAmount,
+        previous ? 'paid' : 'pending',
+        previous?.paid_at || null,
+      ],
+    );
+  }
 };
 // Al borrar una obligación también eliminamos sus movimientos automáticos y
 // devolvemos a la cuenta el dinero que esos movimientos habían descontado.
@@ -227,6 +288,71 @@ app.post('/auth/login', authLimiter, async (req, res) => {
   if (!user || !await bcrypt.compare(req.body.password || '', user.password_hash)) return res.status(401).json({ error: 'Credenciales inválidas' });
   if (bcrypt.getRounds(user.password_hash) < 12) await rows('UPDATE users SET password_hash=$1,updated_at=now() WHERE id=$2', [await bcrypt.hash(req.body.password, 12), user.id]);
   res.json({ user: { id: user.id, name: user.name, email: user.email, currency: user.currency, onboarding_completed: user.onboarding_completed }, token: createToken(user) });
+});
+const passwordResetMessage = 'Si el correo corresponde a una cuenta, enviaremos un código de recuperación.';
+app.post('/auth/forgot-password', passwordResetLimiter, async (req, res) => {
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  if (!validEmail(email)) return res.json({ message: passwordResetMessage });
+  const [user] = await rows('SELECT id FROM users WHERE email=$1', [email]);
+  if (user) {
+    const code = randomInt(0, 100_000_000).toString().padStart(8, '0');
+    await rows('DELETE FROM password_reset_codes WHERE user_id=$1', [user.id]);
+    await rows(
+      `INSERT INTO password_reset_codes(user_id,code_hash,expires_at)
+       VALUES($1,$2,now() + interval '15 minutes')`,
+      [user.id, resetCodeHash(code)],
+    );
+    try {
+      await sendPasswordResetEmail(email, code);
+    } catch (error) {
+      console.error('No se pudo enviar el correo de recuperación:', error?.message || error);
+    }
+  }
+  res.json({ message: passwordResetMessage });
+});
+app.post('/auth/reset-password', passwordResetLimiter, async (req, res) => {
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
+  const password = req.body?.password;
+  const invalidMessage = 'Código inválido o vencido, o la nueva contraseña no cumple los requisitos.';
+  if (!validEmail(email) || !/^\d{8}$/.test(code) || !validPassword(password)) {
+    return res.status(400).json({ error: invalidMessage });
+  }
+  const client = await connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: [reset] } = await client.query(
+      `SELECT pr.id,pr.user_id,pr.code_hash,pr.expires_at,pr.attempts
+       FROM password_reset_codes pr JOIN users u ON u.id=pr.user_id
+       WHERE u.email=$1 AND pr.expires_at>now()
+       ORDER BY pr.created_at DESC LIMIT 1 FOR UPDATE OF pr`,
+      [email],
+    );
+    if (!reset || Number(reset.attempts) >= 5) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: invalidMessage });
+    }
+    const expected = Buffer.from(reset.code_hash, 'hex');
+    const received = Buffer.from(resetCodeHash(code), 'hex');
+    if (!timingSafeEqual(expected, received)) {
+      await client.query('UPDATE password_reset_codes SET attempts=attempts+1 WHERE id=$1', [reset.id]);
+      await client.query('COMMIT');
+      return res.status(400).json({ error: invalidMessage });
+    }
+    await client.query(
+      'UPDATE users SET password_hash=$1,updated_at=now() WHERE id=$2',
+      [await bcrypt.hash(password, 12), reset.user_id],
+    );
+    await client.query('DELETE FROM password_reset_codes WHERE user_id=$1', [reset.user_id]);
+    await client.query('COMMIT');
+    res.json({ ok: true, message: 'Contraseña actualizada. Ya puedes iniciar sesión.' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('No se pudo restablecer la contraseña:', error?.message || error);
+    res.status(500).json({ error: 'No se pudo restablecer la contraseña. Intenta nuevamente.' });
+  } finally {
+    client.release();
+  }
 });
 app.get('/profile', auth, async (req, res) => {
   const [user] = await rows('SELECT id,name,email,currency,national_id,phone,address,city,birth_date,onboarding_completed,created_at FROM users WHERE id=$1', [req.user.id]);
@@ -399,10 +525,9 @@ app.patch('/debts/:id', auth, async (req, res) => {
   const client = await connect();
   try {
     await client.query('BEGIN');
-    const { rows: [debt] } = await client.query('SELECT d.*,COUNT(i.id) FILTER (WHERE i.status=\'paid\')::int paid_count FROM debts d LEFT JOIN debt_installments i ON i.debt_id=d.id WHERE d.id=$1 AND d.user_id=$2 GROUP BY d.id FOR UPDATE', [req.params.id, req.user.id]);
+    const { rows: [debt] } = await client.query('SELECT d.* FROM debts d WHERE d.id=$1 AND d.user_id=$2 FOR UPDATE', [req.params.id, req.user.id]);
     if (!debt) throw clientError('Deuda no encontrada');
     const changingPlan = ['amount', 'total_installments', 'frequency', 'first_payment_date', 'interest_rate_monthly'].some((key) => Object.hasOwn(req.body, key));
-    if (changingPlan && (Number(debt.paid_count) > 0 || debt.credit_card_id)) throw clientError('Solo puedes cambiar el nombre después de registrar pagos o en compras de tarjeta. Así protegemos el historial y las cuotas ya calculadas.');
     if (!changingPlan) {
       if (!name?.trim()) throw clientError('Escribe un nombre para la deuda');
       const { rows: [updated] } = await client.query('UPDATE debts SET name=$1 WHERE id=$2 AND user_id=$3 RETURNING *', [name.trim(), debt.id, req.user.id]);
@@ -411,9 +536,25 @@ app.patch('/debts/:id', auth, async (req, res) => {
     const value = Number(amount); const count = Number(total_installments); const rate = Number(interest_rate_monthly ?? 0);
     if (!name?.trim() || !Number.isFinite(value) || value <= 0 || !Number.isInteger(count) || count < 1 || !Number.isFinite(rate) || rate < 0 || !['monthly', 'biweekly'].includes(frequency) || !validDate(dateFrom(first_payment_date))) throw clientError('Datos de deuda inválidos');
     const plan = paymentPlan(value, count, rate, frequency);
+    const paidInstallments = (await client.query("SELECT installment_number,amount,paid_at FROM debt_installments WHERE debt_id=$1 AND status='paid' ORDER BY installment_number", [debt.id])).rows;
+    const paidTotal = paidInstallments.reduce((sum, installment) => sum + Number(installment.amount), 0);
+    const highestPaidNumber = Math.max(0, ...paidInstallments.map((installment) => Number(installment.installment_number)));
+    if (count < highestPaidNumber) throw clientError(`Ya registraste la cuota ${highestPaidNumber}. El nuevo plan debe tener al menos esa cantidad.`);
+    if (plan.totalPayable + 0.009 < paidTotal) throw clientError(`El nuevo total no puede ser menor a lo ya pagado (${paidTotal.toFixed(2)}).`);
+    const newOutstanding = Math.max(0, Math.round((plan.totalPayable - paidTotal) * 100) / 100);
+    if (count === paidInstallments.length && newOutstanding > 0) throw clientError('Agrega al menos una cuota pendiente o ajusta el total al valor ya pagado.');
+    if (debt.credit_card_id) {
+      const { rows: [card] } = await client.query('SELECT * FROM credit_cards WHERE id=$1 AND user_id=$2 FOR UPDATE', [debt.credit_card_id, req.user.id]);
+      if (!card) throw clientError('Tarjeta asociada no encontrada');
+      const difference = newOutstanding - Number(debt.outstanding_amount);
+      if (difference > 0 && Number(card.current_debt) + difference > Number(card.credit_limit)) throw clientError('El nuevo plan supera el cupo disponible de la tarjeta');
+      await client.query('UPDATE credit_cards SET current_debt=GREATEST(0,current_debt+$1) WHERE id=$2', [difference, card.id]);
+      await client.query("UPDATE transactions SET amount=$1 WHERE user_id=$2 AND debt_id=$3 AND card_id=$4 AND type='expense'", [value, req.user.id, debt.id, card.id]);
+      await client.query('UPDATE card_purchases SET amount=$1,installments=$2,first_payment_date=$3 WHERE debt_id=$4', [value, count, first_payment_date, debt.id]);
+    }
     await client.query('DELETE FROM debt_installments WHERE debt_id=$1', [debt.id]);
-    const { rows: [updated] } = await client.query('UPDATE debts SET name=$1,original_amount=$2,outstanding_amount=$3,total_payable=$3,interest_rate_monthly=$4,total_installments=$5,payment_day=$6,start_date=$7,frequency=$8,first_payment_date=$7 WHERE id=$9 RETURNING *', [name.trim(), value, plan.totalPayable, rate, count, dateFrom(first_payment_date).getDate(), first_payment_date, frequency, debt.id]);
-    await insertSchedule(client, debt.id, count, first_payment_date, frequency, plan.installmentAmount);
+    const { rows: [updated] } = await client.query("UPDATE debts SET name=$1,original_amount=$2,outstanding_amount=$3,total_payable=$4,interest_rate_monthly=$5,total_installments=$6,payment_day=$7,start_date=$8,frequency=$9,first_payment_date=$8,status=$10,closed_at=CASE WHEN $10='paid' THEN now() ELSE NULL END WHERE id=$11 RETURNING *", [name.trim(), value, newOutstanding, plan.totalPayable, rate, count, dateFrom(first_payment_date).getDate(), first_payment_date, frequency, newOutstanding === 0 ? 'paid' : 'active', debt.id]);
+    await insertUpdatedSchedule(client, debt.id, count, first_payment_date, frequency, plan.totalPayable, paidInstallments);
     await client.query('COMMIT');
     res.json(updated);
   } catch (error) { await client.query('ROLLBACK'); res.status(400).json({ error: safeError(error, 'No se pudo actualizar la deuda.') }); } finally { client.release(); }
@@ -459,11 +600,12 @@ app.patch('/income-projections/:month', auth, async (req, res) => {
     return res.status(400).json({ error: 'Registra un ingreso estimado válido para un mes futuro.' });
   }
   const [projection] = await rows(
-    `UPDATE users
-     SET monthly_income_estimate=$1,updated_at=now()
-     WHERE id=$2
-     RETURNING monthly_income_estimate`,
-    [amount, req.user.id],
+    `INSERT INTO income_projections(user_id,month,amount)
+     VALUES($1,$2::date,$3)
+     ON CONFLICT(user_id,month)
+     DO UPDATE SET amount=EXCLUDED.amount,updated_at=now()
+     RETURNING amount`,
+    [req.user.id, `${month}-01`, amount],
   );
   res.json(projection);
 });
@@ -472,15 +614,21 @@ app.get('/payment-planning', auth, async (req, res) => {
   if (!/^\d{4}-\d{2}$/.test(month)) return res.status(400).json({ error: 'Mes inválido. Usa AAAA-MM.' });
   const [year, monthNumber] = month.split('-').map(Number); const monthIndex = monthNumber - 1;
   const todayKey = dateText(new Date()).slice(0, 7);
-  const [scheduled, installments, accounts, investments, preferences] = await Promise.all([
+  const [scheduled, installments, accounts, investments, incomeProjection] = await Promise.all([
     rows('SELECT * FROM scheduled_payments WHERE user_id=$1 AND is_active ORDER BY payment_day,name', [req.user.id]),
     rows(`SELECT i.id installment_id,i.due_date,i.amount,d.id debt_id,d.name,d.credit_card_id,cc.name credit_card_name
       FROM debt_installments i JOIN debts d ON d.id=i.debt_id LEFT JOIN credit_cards cc ON cc.id=d.credit_card_id
       WHERE d.user_id=$1 AND i.status IN ('pending','overdue') AND i.due_date >= $2::date AND i.due_date < ($2::date + interval '1 month')
       ORDER BY i.due_date,i.installment_number`, [req.user.id, `${month}-01`]),
     rows('SELECT id,name,current_balance FROM accounts WHERE user_id=$1 AND is_active ORDER BY name', [req.user.id]),
-    rows("SELECT id,name,target_amount,current_amount,target_date FROM investments WHERE user_id=$1 AND status='active' AND target_amount IS NOT NULL AND target_date IS NOT NULL", [req.user.id]),
-    rows('SELECT monthly_income_estimate FROM users WHERE id=$1', [req.user.id]),
+    rows(`SELECT i.id,i.name,i.target_amount,i.current_amount,i.start_date,i.target_date,
+        COALESCE((SELECT SUM(ic.amount) FROM investment_contributions ic
+          WHERE ic.investment_id=i.id AND ic.contribution_date >= $2::date
+            AND ic.contribution_date < ($2::date + interval '1 month')
+            AND ic.note LIKE 'Cuota programada:%'),0) AS paid_projected_quota
+      FROM investments i
+      WHERE i.user_id=$1 AND i.status='active' AND i.target_amount IS NOT NULL AND i.target_date IS NOT NULL`, [req.user.id, `${month}-01`]),
+    rows('SELECT amount FROM income_projections WHERE user_id=$1 AND month=$2::date', [req.user.id, `${month}-01`]),
   ]);
   const fixed = scheduled.flatMap((payment) => {
     const nextDueDate = dateText(new Date(payment.next_due_date));
@@ -493,10 +641,12 @@ app.get('/payment-planning', auth, async (req, res) => {
   const debtItems = installments.map((item) => ({ id: item.installment_id, installment_id: item.installment_id, debt_id: item.debt_id, source: item.credit_card_id ? 'card' : 'debt', name: item.credit_card_id ? `${item.credit_card_name}: ${item.name.replace(/^Compra [^:]+:\s*/, '')}` : item.name, amount: Number(item.amount), due_date: dateText(new Date(item.due_date)), credit_card_name: item.credit_card_name }));
   const investmentItems = investments.flatMap((investment) => {
     const targetDate = dateFrom(investment.target_date);
+    const startDate = dateFrom(investment.start_date);
     const targetMonth = targetDate.getFullYear() * 12 + targetDate.getMonth();
+    const startMonth = startDate.getFullYear() * 12 + startDate.getMonth();
     const selectedMonth = year * 12 + monthIndex;
     const remaining = Math.max(0, Number(investment.target_amount) - Number(investment.current_amount));
-    if (remaining <= 0 || selectedMonth > targetMonth) return [];
+    if (remaining <= 0 || Number(investment.paid_projected_quota) > 0 || selectedMonth < startMonth || selectedMonth > targetMonth) return [];
     const monthsLeft = Math.max(1, targetMonth - selectedMonth + 1);
     const amount = Math.ceil(remaining / monthsLeft);
     return [{ id: `investment-${investment.id}-${month}`, investment_id: investment.id, source: 'investment', name: `Meta: ${investment.name}`, amount, due_date: dateText(atDay(year, monthIndex, Math.min(targetDate.getDate(), 30))), notes: `Aporte sugerido para alcanzar la meta el ${dateText(targetDate)}` }];
@@ -509,8 +659,8 @@ app.get('/payment-planning', auth, async (req, res) => {
     return { id: account.id, name: account.name, balance: Number(account.current_balance), fixed_total: fixedTotal, projected_balance: Number(account.current_balance) - fixedTotal };
   });
   const isProjection = month > todayKey;
-  const projectedIncome = isProjection && preferences[0]?.monthly_income_estimate != null
-    ? Number(preferences[0].monthly_income_estimate)
+  const projectedIncome = isProjection && incomeProjection[0]?.amount != null
+    ? Number(incomeProjection[0].amount)
     : null;
   res.json({ month, is_projection: isProjection, projected_income: projectedIncome, items, groups, total: sum(items), up_to_15_total: sum(groups.up_to_15), after_15_total: sum(groups.after_15), account_totals });
 });
@@ -623,8 +773,8 @@ app.delete('/investments/:id', auth, async (req, res) => {
 });
 app.get('/investments/:id/contributions', auth, async (req, res) => res.json(await rows(`SELECT ic.*,a.name account_name FROM investment_contributions ic JOIN investments i ON i.id=ic.investment_id LEFT JOIN accounts a ON a.id=ic.account_id WHERE ic.investment_id=$1 AND i.user_id=$2 ORDER BY ic.contribution_date DESC,ic.created_at DESC`, [req.params.id, req.user.id])));
 app.post('/investments/:id/contributions', auth, async (req, res) => {
-  const { amount, contribution_date, note, account_id } = req.body; const value = Number(amount); const date = contribution_date || dateText(new Date());
-  if (!Number.isFinite(value) || value <= 0 || !validDate(dateFrom(date))) return res.status(400).json({ error: 'Aporte inválido' });
+  const { amount, contribution_date, transaction_date, note, account_id } = req.body; const value = Number(amount); const date = contribution_date || dateText(new Date()); const transactionDate = transaction_date || date;
+  if (!Number.isFinite(value) || value <= 0 || !validDate(dateFrom(date)) || !validDate(dateFrom(transactionDate))) return res.status(400).json({ error: 'Aporte inválido' });
   const client = await connect();
   try {
     await client.query('BEGIN');
@@ -634,7 +784,7 @@ app.post('/investments/:id/contributions', auth, async (req, res) => {
     if (account_id) {
       const [account] = (await client.query('SELECT id FROM accounts WHERE id=$1 AND user_id=$2 AND is_active', [account_id, req.user.id])).rows;
       if (!account) throw clientError('Cuenta de origen inválida');
-      const [transaction] = (await client.query("INSERT INTO transactions(user_id,account_id,investment_id,type,amount,transaction_date,note) VALUES($1,$2,$3,'transfer',$4,$5,$6) RETURNING id", [req.user.id, account_id, investment.id, value, date, `Aporte a ${investment.name}${note ? `: ${note}` : ''}`])).rows;
+      const [transaction] = (await client.query("INSERT INTO transactions(user_id,account_id,investment_id,type,amount,transaction_date,note) VALUES($1,$2,$3,'transfer',$4,$5,$6) RETURNING id", [req.user.id, account_id, investment.id, value, transactionDate, `Aporte a ${investment.name}${note ? `: ${note}` : ''}`])).rows;
       transactionId = transaction.id;
       await client.query('UPDATE accounts SET current_balance=current_balance-$1 WHERE id=$2', [value, account_id]);
     }
