@@ -1026,8 +1026,12 @@ app.get('/payment-planning', auth, async (req, res) => {
   if (!/^\d{4}-\d{2}$/.test(month)) return res.status(400).json({ error: 'Mes inválido. Usa AAAA-MM.' });
   const [year, monthNumber] = month.split('-').map(Number); const monthIndex = monthNumber - 1;
   const todayKey = todayInBogota().slice(0, 7);
-  const [scheduled, installments, accounts, investments, incomeProjection] = await Promise.all([
-    rows('SELECT * FROM scheduled_payments WHERE user_id=$1 AND is_active ORDER BY payment_day,name', [req.user.id]),
+  const [scheduled, paidOccurrences, installments, accounts, investments, incomeProjection] = await Promise.all([
+    rows(`SELECT p.*,(p.created_at AT TIME ZONE 'America/Bogota')::date::text created_local_date
+      FROM scheduled_payments p WHERE p.user_id=$1 AND p.is_active ORDER BY p.payment_day,p.name`, [req.user.id]),
+    rows(`SELECT h.scheduled_payment_id,h.due_date::text due_date
+      FROM scheduled_payment_history h JOIN scheduled_payments p ON p.id=h.scheduled_payment_id
+      WHERE p.user_id=$1 AND h.due_date < ($2::date + interval '1 month')`, [req.user.id, `${month}-01`]),
     rows(`SELECT i.id installment_id,i.due_date,i.amount,d.id debt_id,d.name,d.credit_card_id,cc.name credit_card_name
       FROM debt_installments i JOIN debts d ON d.id=i.debt_id LEFT JOIN credit_cards cc ON cc.id=d.credit_card_id
       WHERE d.user_id=$1 AND i.status IN ('pending','overdue') AND i.due_date >= $2::date AND i.due_date < ($2::date + interval '1 month')
@@ -1042,13 +1046,36 @@ app.get('/payment-planning', auth, async (req, res) => {
       WHERE i.user_id=$1 AND i.status='active' AND i.target_amount IS NOT NULL AND i.target_date IS NOT NULL`, [req.user.id, `${month}-01`]),
     rows('SELECT amount FROM income_projections WHERE user_id=$1 AND month=$2::date', [req.user.id, `${month}-01`]),
   ]);
+  const paidOccurrenceKeys = new Set(paidOccurrences.map((item) => `${item.scheduled_payment_id}:${item.due_date}`));
   const fixed = scheduled.flatMap((payment) => {
-    const nextDueDate = dateText(new Date(payment.next_due_date));
-    const nextKey = nextDueDate.slice(0, 7);
-    const shouldInclude = month === todayKey ? nextKey === month : month > todayKey && (payment.frequency === 'monthly' || nextKey === month);
-    if (!shouldInclude) return [];
-    const dueDate = month === todayKey ? nextDueDate : dateText(atDay(year, monthIndex, Number(payment.payment_day)));
-    return [{ id: payment.id, source: 'fixed', name: payment.name, amount: Number(payment.amount), due_date: dueDate, account_id: payment.account_id, notes: payment.notes }];
+    const day = Number(payment.payment_day);
+    const createdDate = dateFrom(payment.created_local_date);
+    const firstDueThisMonth = atDay(createdDate.getFullYear(), createdDate.getMonth(), day);
+    const firstDueDate = createdDate > firstDueThisMonth
+      ? atDay(createdDate.getFullYear(), createdDate.getMonth() + 1, day)
+      : firstDueThisMonth;
+    const firstDueMonth = firstDueDate.getFullYear() * 12 + firstDueDate.getMonth();
+    const selectedMonth = year * 12 + monthIndex;
+    const firstDueKey = dateText(firstDueDate);
+    const nextDueDate = dateText(dateFrom(payment.next_due_date));
+    const nextDueMonth = dateFrom(nextDueDate).getFullYear() * 12 + dateFrom(nextDueDate).getMonth();
+    const occurrenceDates = payment.frequency === 'monthly'
+      ? Array.from({ length: Math.max(0, selectedMonth - firstDueMonth + 1) }, (_, index) => (
+        dateText(atDay(firstDueDate.getFullYear(), firstDueDate.getMonth() + index, day))
+      ))
+      : selectedMonth === nextDueMonth ? [nextDueDate] : [];
+    return occurrenceDates
+      .filter((dueDate) => dueDate >= firstDueKey && !paidOccurrenceKeys.has(`${payment.id}:${dueDate}`))
+      .map((dueDate) => ({
+        id: payment.id,
+        source: 'fixed',
+        name: payment.name,
+        amount: Number(payment.amount),
+        due_date: dueDate,
+        account_id: payment.account_id,
+        notes: payment.notes,
+        is_overdue: dueDate < todayInBogota(),
+      }));
   });
   const debtItems = installments.map((item) => ({ id: item.installment_id, installment_id: item.installment_id, debt_id: item.debt_id, source: item.credit_card_id ? 'card' : 'debt', name: item.credit_card_id ? `${item.credit_card_name}: ${item.name.replace(/^Compra [^:]+:\s*/, '')}` : item.name, amount: Number(item.amount), due_date: dateText(new Date(item.due_date)), credit_card_name: item.credit_card_name }));
   const investmentItems = investments.flatMap((investment) => {
@@ -1207,7 +1234,80 @@ app.post('/investments/:id/contributions', auth, async (req, res) => {
 });
 app.patch('/scheduled_payments/:id/pay', auth, async (req, res) => {
   const client = await connect();
-  try { await client.query('BEGIN'); const [p] = (await client.query('SELECT * FROM scheduled_payments WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id])).rows; if (!p) throw clientError('Pago no encontrado'); const accountId = req.body?.account_id || p.account_id; if (!accountId) throw clientError('Selecciona una cuenta para pagar'); const [account] = (await client.query('SELECT id FROM accounts WHERE id=$1 AND user_id=$2 AND is_active', [accountId, req.user.id])).rows; if (!account) throw clientError('Cuenta de pago inválida'); await client.query('INSERT INTO scheduled_payment_history(scheduled_payment_id,amount) VALUES($1,$2)', [p.id, p.amount]); await client.query("INSERT INTO transactions(user_id,account_id,category_id,scheduled_payment_id,type,amount,transaction_date,note) VALUES($1,$2,$3,$4,'expense',$5,current_date,$6)", [req.user.id, accountId, p.category_id, p.id, p.amount, `Pago programado: ${p.name}`]); await client.query('UPDATE accounts SET current_balance=current_balance-$1 WHERE id=$2 AND user_id=$3', [p.amount, accountId, req.user.id]); await client.query("UPDATE scheduled_payments SET next_due_date=(next_due_date + interval '1 month')::date WHERE id=$1", [p.id]); await client.query('COMMIT'); res.json({ ok: true }); } catch (error) { await client.query('ROLLBACK'); res.status(400).json({ error: safeError(error, 'No se pudo registrar el pago.') }); } finally { client.release(); }
+  try {
+    await client.query('BEGIN');
+    const { rows: [p] } = await client.query(
+      `SELECT p.*,(p.created_at AT TIME ZONE 'America/Bogota')::date::text created_local_date
+       FROM scheduled_payments p WHERE p.id=$1 AND p.user_id=$2 AND p.is_active FOR UPDATE`,
+      [req.params.id, req.user.id],
+    );
+    if (!p) throw clientError('Pago no encontrado o inactivo');
+    const accountId = req.body?.account_id || p.account_id;
+    if (!accountId) throw clientError('Selecciona una cuenta para pagar');
+    const { rows: [account] } = await client.query(
+      'SELECT id FROM accounts WHERE id=$1 AND user_id=$2 AND is_active FOR UPDATE',
+      [accountId, req.user.id],
+    );
+    if (!account) throw clientError('Cuenta de pago inválida');
+
+    const dueDate = String(req.body?.due_date || dateText(new Date(p.next_due_date)));
+    if (!validIsoDate(dueDate)) throw clientError('La fecha del vencimiento no es válida');
+    const dueDateValue = dateFrom(dueDate);
+    const expectedDueDate = p.frequency === 'monthly'
+      ? dateText(atDay(dueDateValue.getFullYear(), dueDateValue.getMonth(), Number(p.payment_day)))
+      : dateText(new Date(p.next_due_date));
+    const createdDate = dateFrom(p.created_local_date);
+    const firstDueThisMonth = atDay(createdDate.getFullYear(), createdDate.getMonth(), Number(p.payment_day));
+    const firstDueDate = createdDate > firstDueThisMonth
+      ? atDay(createdDate.getFullYear(), createdDate.getMonth() + 1, Number(p.payment_day))
+      : firstDueThisMonth;
+    if (dueDate !== expectedDueDate || dueDate < dateText(firstDueDate)) {
+      throw clientError('El vencimiento no corresponde a este pago programado.');
+    }
+    const { rows: [existingPayment] } = await client.query(
+      'SELECT id FROM scheduled_payment_history WHERE scheduled_payment_id=$1 AND due_date=$2 FOR UPDATE',
+      [p.id, dueDate],
+    );
+    if (existingPayment) throw clientError('Este vencimiento ya aparece pagado.');
+
+    await client.query(
+      'INSERT INTO scheduled_payment_history(scheduled_payment_id,due_date,amount) VALUES($1,$2,$3)',
+      [p.id, dueDate, p.amount],
+    );
+    await client.query(
+      "INSERT INTO transactions(user_id,account_id,category_id,scheduled_payment_id,type,amount,transaction_date,note) VALUES($1,$2,$3,$4,'expense',$5,current_date,$6)",
+      [req.user.id, accountId, p.category_id, p.id, p.amount, `Pago programado: ${p.name}`],
+    );
+    await client.query(
+      'UPDATE accounts SET current_balance=current_balance-$1 WHERE id=$2 AND user_id=$3',
+      [p.amount, accountId, req.user.id],
+    );
+
+    if (p.frequency === 'once') {
+      await client.query('UPDATE scheduled_payments SET is_active=false WHERE id=$1', [p.id]);
+    } else {
+      const { rows: paidRows } = await client.query(
+        'SELECT due_date::text due_date FROM scheduled_payment_history WHERE scheduled_payment_id=$1',
+        [p.id],
+      );
+      const paidDates = new Set(paidRows.map((row) => row.due_date));
+      let nextDueDate = null;
+      for (let index = 0; index < 1200; index += 1) {
+        const occurrence = dateText(atDay(firstDueDate.getFullYear(), firstDueDate.getMonth() + index, Number(p.payment_day)));
+        if (!paidDates.has(occurrence)) {
+          nextDueDate = occurrence;
+          break;
+        }
+      }
+      if (!nextDueDate) throw clientError('No se pudo calcular el próximo vencimiento');
+      await client.query('UPDATE scheduled_payments SET next_due_date=$1 WHERE id=$2', [nextDueDate, p.id]);
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true, due_date: dueDate });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error: safeError(error, 'No se pudo registrar el pago.') });
+  } finally { client.release(); }
 });
 app.patch('/scheduled_payments/:id', auth, async (req, res) => {
   const { account_id, category_id, name, amount, payment_day, next_due_date, frequency, notes, is_active } = req.body;
