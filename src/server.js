@@ -166,6 +166,15 @@ const dueFor = (firstDate, frequency, index) => {
   if (frequency === 'biweekly') { date.setDate(date.getDate() + index * 15); return dateText(date); }
   return dateText(atDay(date.getFullYear(), date.getMonth() + index, date.getDate()));
 };
+const firstScheduledDueDate = (createdLocalDate, nextDueDate, paymentDay) => {
+  const createdDate = dateFrom(createdLocalDate);
+  const dueInCreatedMonth = atDay(createdDate.getFullYear(), createdDate.getMonth(), Number(paymentDay));
+  const inferredFirstDue = createdDate > dueInCreatedMonth
+    ? atDay(createdDate.getFullYear(), createdDate.getMonth() + 1, Number(paymentDay))
+    : dueInCreatedMonth;
+  const savedDueDate = dateFrom(nextDueDate);
+  return savedDueDate < inferredFirstDue ? savedDueDate : inferredFirstDue;
+};
 const paymentPlan = (amount, installments, monthlyRate, frequency = 'monthly') => {
   const rate = (monthlyRate / 100) / (frequency === 'biweekly' ? 2 : 1);
   const payment = rate === 0 ? amount / installments : (amount * rate * Math.pow(1 + rate, installments)) / (Math.pow(1 + rate, installments) - 1);
@@ -1049,11 +1058,7 @@ app.get('/payment-planning', auth, async (req, res) => {
   const paidOccurrenceKeys = new Set(paidOccurrences.map((item) => `${item.scheduled_payment_id}:${item.due_date}`));
   const fixed = scheduled.flatMap((payment) => {
     const day = Number(payment.payment_day);
-    const createdDate = dateFrom(payment.created_local_date);
-    const firstDueThisMonth = atDay(createdDate.getFullYear(), createdDate.getMonth(), day);
-    const firstDueDate = createdDate > firstDueThisMonth
-      ? atDay(createdDate.getFullYear(), createdDate.getMonth() + 1, day)
-      : firstDueThisMonth;
+    const firstDueDate = firstScheduledDueDate(payment.created_local_date, payment.next_due_date, day);
     const firstDueMonth = firstDueDate.getFullYear() * 12 + firstDueDate.getMonth();
     const selectedMonth = year * 12 + monthIndex;
     const firstDueKey = dateText(firstDueDate);
@@ -1256,11 +1261,7 @@ app.patch('/scheduled_payments/:id/pay', auth, async (req, res) => {
     const expectedDueDate = p.frequency === 'monthly'
       ? dateText(atDay(dueDateValue.getFullYear(), dueDateValue.getMonth(), Number(p.payment_day)))
       : dateText(new Date(p.next_due_date));
-    const createdDate = dateFrom(p.created_local_date);
-    const firstDueThisMonth = atDay(createdDate.getFullYear(), createdDate.getMonth(), Number(p.payment_day));
-    const firstDueDate = createdDate > firstDueThisMonth
-      ? atDay(createdDate.getFullYear(), createdDate.getMonth() + 1, Number(p.payment_day))
-      : firstDueThisMonth;
+    const firstDueDate = firstScheduledDueDate(p.created_local_date, p.next_due_date, p.payment_day);
     if (dueDate !== expectedDueDate || dueDate < dateText(firstDueDate)) {
       throw clientError('El vencimiento no corresponde a este pago programado.');
     }
