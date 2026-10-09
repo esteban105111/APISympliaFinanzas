@@ -9,7 +9,7 @@ import dotenv from 'dotenv';
 import { createHmac, randomInt, timingSafeEqual } from 'node:crypto';
 import ExcelJS from 'exceljs';
 import PDFDocument from 'pdfkit';
-import { scheduledOccurrencesForMonth } from './scheduled_payment_calendar.js';
+import { firstScheduledDueDate, nextUnpaidScheduledDueDate, scheduledOccurrencesForMonth } from './scheduled_payment_calendar.js';
 import { pool, query, connect } from './db.js';
 
 dotenv.config();
@@ -166,15 +166,6 @@ const dueFor = (firstDate, frequency, index) => {
   const date = dateFrom(firstDate);
   if (frequency === 'biweekly') { date.setDate(date.getDate() + index * 15); return dateText(date); }
   return dateText(atDay(date.getFullYear(), date.getMonth() + index, date.getDate()));
-};
-const firstScheduledDueDate = (createdLocalDate, nextDueDate, paymentDay) => {
-  const createdDate = dateFrom(createdLocalDate);
-  const dueInCreatedMonth = atDay(createdDate.getFullYear(), createdDate.getMonth(), Number(paymentDay));
-  const inferredFirstDue = createdDate > dueInCreatedMonth
-    ? atDay(createdDate.getFullYear(), createdDate.getMonth() + 1, Number(paymentDay))
-    : dueInCreatedMonth;
-  const savedDueDate = dateFrom(nextDueDate);
-  return savedDueDate < inferredFirstDue ? savedDueDate : inferredFirstDue;
 };
 const paymentPlan = (amount, installments, monthlyRate, frequency = 'monthly') => {
   const rate = (monthlyRate / 100) / (frequency === 'biweekly' ? 2 : 1);
@@ -515,14 +506,19 @@ resource('accounts', ['name', 'type', 'institution', 'current_balance', 'color',
 app.get('/scheduled_payments', auth, async (req, res) => res.json(await rows('SELECT * FROM scheduled_payments WHERE user_id=$1 ORDER BY created_at DESC', [req.user.id])));
 app.post('/scheduled_payments', auth, async (req, res) => {
   const { account_id, category_id, name, amount, payment_day, next_due_date, frequency = 'monthly', notes } = req.body;
+  const startDate = req.body.start_date || next_due_date;
   const value = Number(amount); const day = Number(payment_day);
-  if (!name?.trim() || !Number.isFinite(value) || value <= 0 || ![15, 30].includes(day) || !validDate(dateFrom(next_due_date)) || !['monthly', 'once'].includes(frequency)) return res.status(400).json({ error: 'Datos del pago programado inválidos' });
+  if (!name?.trim() || !Number.isFinite(value) || value <= 0 || ![15, 30].includes(day) || !validIsoDate(startDate) || !validDate(dateFrom(next_due_date)) || !['monthly', 'once'].includes(frequency)) return res.status(400).json({ error: 'Datos del pago programado inválidos' });
+  const firstDueDate = frequency === 'monthly'
+    ? firstScheduledDueDate(startDate, day)
+    : dateText(dateFrom(next_due_date));
+  if (frequency === 'once' && firstDueDate < startDate) return res.status(400).json({ error: 'La fecha del pago debe ser igual o posterior a la fecha de inicio.' });
   const client = await connect();
   try {
     await client.query('BEGIN');
     await ensureOwnedReference(client, 'accounts', account_id, req.user.id, 'Cuenta');
     await ensureOwnedReference(client, 'categories', category_id, req.user.id, 'Categoría', 'expense');
-    const { rows: [payment] } = await client.query('INSERT INTO scheduled_payments(user_id,account_id,category_id,name,amount,payment_day,next_due_date,frequency,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *', [req.user.id, account_id || null, category_id || null, name.trim(), value, day, next_due_date, frequency, notes?.trim() || null]);
+    const { rows: [payment] } = await client.query('INSERT INTO scheduled_payments(user_id,account_id,category_id,name,amount,payment_day,start_date,next_due_date,frequency,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *', [req.user.id, account_id || null, category_id || null, name.trim(), value, day, startDate, firstDueDate, frequency, notes?.trim() || null]);
     await client.query('COMMIT');
     res.status(201).json(payment);
   } catch (error) { await client.query('ROLLBACK'); res.status(400).json({ error: safeError(error, 'No se pudo crear el pago programado.') }); } finally { client.release(); }
@@ -1125,8 +1121,8 @@ app.get('/payment-planning', auth, async (req, res) => {
   const [year, monthNumber] = month.split('-').map(Number); const monthIndex = monthNumber - 1;
   const todayKey = todayInBogota().slice(0, 7);
   const [scheduled, paidOccurrences, installments, accounts, investments, incomeProjection] = await Promise.all([
-    rows(`SELECT p.*,(p.created_at AT TIME ZONE 'America/Bogota')::date::text created_local_date
-      FROM scheduled_payments p WHERE p.user_id=$1 AND p.is_active ORDER BY p.payment_day,p.name`, [req.user.id]),
+    rows(`SELECT p.* FROM scheduled_payments p
+      WHERE p.user_id=$1 AND p.is_active ORDER BY p.payment_day,p.name`, [req.user.id]),
     rows(`SELECT h.scheduled_payment_id,h.due_date::text due_date
       FROM scheduled_payment_history h JOIN scheduled_payments p ON p.id=h.scheduled_payment_id
       WHERE p.user_id=$1 AND h.due_date < ($2::date + interval '1 month')`, [req.user.id, `${month}-01`]),
@@ -1147,8 +1143,9 @@ app.get('/payment-planning', auth, async (req, res) => {
   const paidOccurrenceKeys = new Set(paidOccurrences.map((item) => `${item.scheduled_payment_id}:${item.due_date}`));
   const fixed = scheduled.flatMap((payment) => {
     const day = Number(payment.payment_day);
-    const firstDueDate = firstScheduledDueDate(payment.created_local_date, payment.next_due_date, day);
-    const selectedMonth = year * 12 + monthIndex;
+    const firstDueDate = dateFrom(payment.frequency === 'monthly'
+      ? firstScheduledDueDate(payment.start_date, day)
+      : payment.start_date);
     const firstDueKey = dateText(firstDueDate);
     const nextDueDate = dateText(dateFrom(payment.next_due_date));
     const occurrenceDates = scheduledOccurrencesForMonth({
@@ -1332,8 +1329,8 @@ app.patch('/scheduled_payments/:id/pay', auth, async (req, res) => {
   try {
     await client.query('BEGIN');
     const { rows: [p] } = await client.query(
-      `SELECT p.*,(p.created_at AT TIME ZONE 'America/Bogota')::date::text created_local_date
-       FROM scheduled_payments p WHERE p.id=$1 AND p.user_id=$2 AND p.is_active FOR UPDATE`,
+      `SELECT p.* FROM scheduled_payments p
+       WHERE p.id=$1 AND p.user_id=$2 AND p.is_active FOR UPDATE`,
       [req.params.id, req.user.id],
     );
     if (!p) throw clientError('Pago no encontrado o inactivo');
@@ -1351,7 +1348,9 @@ app.patch('/scheduled_payments/:id/pay', auth, async (req, res) => {
     const expectedDueDate = p.frequency === 'monthly'
       ? dateText(atDay(dueDateValue.getFullYear(), dueDateValue.getMonth(), Number(p.payment_day)))
       : dateText(new Date(p.next_due_date));
-    const firstDueDate = firstScheduledDueDate(p.created_local_date, p.next_due_date, p.payment_day);
+    const firstDueDate = dateFrom(p.frequency === 'monthly'
+      ? firstScheduledDueDate(p.start_date, p.payment_day)
+      : p.start_date);
     if (dueDate !== expectedDueDate || dueDate < dateText(firstDueDate)) {
       throw clientError('El vencimiento no corresponde a este pago programado.');
     }
@@ -1382,14 +1381,7 @@ app.patch('/scheduled_payments/:id/pay', auth, async (req, res) => {
         [p.id],
       );
       const paidDates = new Set(paidRows.map((row) => row.due_date));
-      let nextDueDate = null;
-      for (let index = 0; index < 1200; index += 1) {
-        const occurrence = dateText(atDay(firstDueDate.getFullYear(), firstDueDate.getMonth() + index, Number(p.payment_day)));
-        if (!paidDates.has(occurrence)) {
-          nextDueDate = occurrence;
-          break;
-        }
-      }
+      const nextDueDate = nextUnpaidScheduledDueDate(p.start_date, p.payment_day, paidDates);
       if (!nextDueDate) throw clientError('No se pudo calcular el próximo vencimiento');
       await client.query('UPDATE scheduled_payments SET next_due_date=$1 WHERE id=$2', [nextDueDate, p.id]);
     }
@@ -1407,11 +1399,29 @@ app.patch('/scheduled_payments/:id', auth, async (req, res) => {
   const client = await connect();
   try {
     await client.query('BEGIN');
-    const { rows: [exists] } = await client.query('SELECT id FROM scheduled_payments WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+    const { rows: [exists] } = await client.query('SELECT id,start_date FROM scheduled_payments WHERE id=$1 AND user_id=$2 FOR UPDATE', [req.params.id, req.user.id]);
     if (!exists) throw clientError('Pago fijo no encontrado');
+    const rawStartDate = req.body.start_date || exists.start_date || next_due_date;
+    const startDate = typeof rawStartDate === 'string'
+      ? rawStartDate
+      : dateText(dateFrom(rawStartDate));
+    if (!validIsoDate(startDate)) throw clientError('La fecha de inicio no es válida.');
+    const firstDueDate = frequency === 'monthly'
+      ? firstScheduledDueDate(startDate, day)
+      : dateText(dateFrom(next_due_date));
+    if (frequency === 'once' && firstDueDate < startDate) throw clientError('La fecha del pago debe ser igual o posterior a la fecha de inicio.');
+    let nextDueDate = firstDueDate;
+    if (frequency === 'monthly') {
+      const { rows: paidRows } = await client.query(
+        'SELECT due_date::text due_date FROM scheduled_payment_history WHERE scheduled_payment_id=$1',
+        [exists.id],
+      );
+      nextDueDate = nextUnpaidScheduledDueDate(startDate, day, new Set(paidRows.map((row) => row.due_date)));
+      if (!nextDueDate) throw clientError('No se pudo calcular el próximo vencimiento');
+    }
     await ensureOwnedReference(client, 'accounts', account_id, req.user.id, 'Cuenta');
     await ensureOwnedReference(client, 'categories', category_id, req.user.id, 'Categoría', 'expense');
-    const { rows: [payment] } = await client.query('UPDATE scheduled_payments SET account_id=$1,category_id=$2,name=$3,amount=$4,payment_day=$5,next_due_date=$6,frequency=$7,notes=$8,is_active=$9 WHERE id=$10 AND user_id=$11 RETURNING *', [account_id || null, category_id || null, name.trim(), value, day, next_due_date, frequency, notes?.trim() || null, is_active !== false, req.params.id, req.user.id]);
+    const { rows: [payment] } = await client.query('UPDATE scheduled_payments SET account_id=$1,category_id=$2,name=$3,amount=$4,payment_day=$5,start_date=$6,next_due_date=$7,frequency=$8,notes=$9,is_active=$10 WHERE id=$11 AND user_id=$12 RETURNING *', [account_id || null, category_id || null, name.trim(), value, day, startDate, nextDueDate, frequency, notes?.trim() || null, is_active !== false, req.params.id, req.user.id]);
     await client.query('COMMIT');
     res.json(payment);
   } catch (error) { await client.query('ROLLBACK'); res.status(400).json({ error: safeError(error, 'No se pudo actualizar el pago fijo.') }); } finally { client.release(); }
