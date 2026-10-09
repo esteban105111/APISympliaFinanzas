@@ -9,6 +9,7 @@ import dotenv from 'dotenv';
 import { createHmac, randomInt, timingSafeEqual } from 'node:crypto';
 import ExcelJS from 'exceljs';
 import PDFDocument from 'pdfkit';
+import { scheduledOccurrencesForMonth } from './scheduled_payment_calendar.js';
 import { pool, query, connect } from './db.js';
 
 dotenv.config();
@@ -1147,16 +1148,17 @@ app.get('/payment-planning', auth, async (req, res) => {
   const fixed = scheduled.flatMap((payment) => {
     const day = Number(payment.payment_day);
     const firstDueDate = firstScheduledDueDate(payment.created_local_date, payment.next_due_date, day);
-    const firstDueMonth = firstDueDate.getFullYear() * 12 + firstDueDate.getMonth();
     const selectedMonth = year * 12 + monthIndex;
     const firstDueKey = dateText(firstDueDate);
     const nextDueDate = dateText(dateFrom(payment.next_due_date));
-    const nextDueMonth = dateFrom(nextDueDate).getFullYear() * 12 + dateFrom(nextDueDate).getMonth();
-    const occurrenceDates = payment.frequency === 'monthly'
-      ? Array.from({ length: Math.max(0, selectedMonth - firstDueMonth + 1) }, (_, index) => (
-        dateText(atDay(firstDueDate.getFullYear(), firstDueDate.getMonth() + index, day))
-      ))
-      : selectedMonth === nextDueMonth ? [nextDueDate] : [];
+    const occurrenceDates = scheduledOccurrencesForMonth({
+      frequency: payment.frequency,
+      firstDueDate: firstDueKey,
+      nextDueDate,
+      paymentDay: day,
+      year,
+      month: monthNumber,
+    });
     return occurrenceDates
       .filter((dueDate) => dueDate >= firstDueKey && !paidOccurrenceKeys.has(`${payment.id}:${dueDate}`))
       .map((dueDate) => ({
